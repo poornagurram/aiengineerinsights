@@ -1,0 +1,430 @@
+# Google's A2A: Engineering Notes
+
+**Why A2A?** 2024 produced a proliferation of agent frameworks, each exposing its own flavour of REST or webhook. A2A offers a concise JSON‑RPC contract so agents built in different stacks can exchange tasks, artifacts, and status updates without revealing internal details.
+
+This post is a code‑oriented walkthrough of the A2A v0.1.0 specification, surfacing the engineering trade‑offs behind key design choices and showing how they matter in real deployments.
+![[a2a_demo_arch.png]]
+
+Image Credits: https://github.com/google/A2A
+## 1 Transport Decisions: Why HTTP(s) + JSON‑RPC + SSE (Server‑Sent Events)?
+
+### 1.1 Why not gRPC?
+
+gRPC is great for binary framing and bidirectional streams, but it forces HTTP/2 and Protobufs. Browser‑side JavaScript can't speak it natively, and every language needs stubs. A2A prefers ubiquity over tight coupling, so it reuses:
+
+```
+
+HTTP/1.1 or HTTP/2 # any reverse‑proxy already speaks this
+
+Content‑Type: application/json
+
+```
+
+### 1.2 JSON‑RPC 2.0: "fat POST, skinny contract"
+
+JSON‑RPC keeps the entire method contract inside a single JSON blob:
+
+```
+{
+
+"jsonrpc": "2.0",
+
+"method": "tasks/send",
+
+"params": {...},
+
+"id": "123"
+
+}
+```
+
+Because both _method_ and _params_ are explicit, the server doesn't care about URL routing. Compare that to REST where semantics hide in path segments.
+
+### 1.3 Server‑Sent Events for Streaming
+
+`tasks/sendSubscribe` returns a `text/event-stream`. Each `data:` line is _itself_ a JSON‑RPC response containing either a `TaskStatusUpdateEvent` or `TaskArtifactUpdateEvent`, so you multiplex task status + artifact chunks without inventing a new framing protocol.
+
+```
+
+data: {"jsonrpc":"2.0","result":{"id":"task-abc","status":{"state":"in-progress"}},"id":"123"}
+
+data: {"jsonrpc":"2.0","result":{"id":"task-abc","artifact":{"parts":[…]}},"id":"123"}
+
+```
+
+Browsers consume this with one line:
+
+```
+
+const es = new EventSource("/a2a/api/subscribe?id=123");
+
+es.onmessage = console.log;
+
+```
+
+## 2 Discovery Is a File, Not an API
+
+### 2.1 The Agent Card
+
+Agents advertise a **single JSON file** at `/.well-known/agent.json` (recommended location, though other discovery mechanisms are possible). This is similar to `robots.txt` for search engines.
+
+| Field                        | What is it?                                       |
+| ---------------------------- | ------------------------------------------------- |
+| `url`                        | canonical A2A endpoint; clients cache it          |
+| `capabilities.streaming`     | tells clients they can call `tasks/sendSubscribe` |
+| `authentication.schemes`     | externalises auth (e.g., `["Bearer"]`)            |
+| `skills[]`                   | machine‑readable catalogue of verbs               |
+| `authentication.credentials` | scheme-specific configuration (NEVER secrets)     |
+
+The file‑based approach avoids circular bootstrapping ("how do I auth to discover how to auth?") and makes local‑dev trivial – just drop the JSON next to your Ngrok tunnel.
+
+### 2.2 Versioning & Provider
+
+`version` is arbitrary (SemVer not enforced) and lives **outside** the HTTP headers. This lets you roll out a new agent image behind the same URL while clients can still pin to `1.x`.
+
+## 3 Task = Long‑Running Stateful Job
+
+### 3.1 State Machine
+
+```
+
+submitted → working → { completed | failed | canceled | input‑required }
+
+```
+
+`input‑required` enables RPC with Human-in-loop feature. The agent can pause, ask for OAuth tokens or human approval, then resume the same task.
+
+### 3.2 Artifacts vs Messages
+
+- **Message**: conversational breadcrumb (`role: user|agent`)
+
+- **Artifact**: stable output of the task (file, JSON, image)
+
+Separating them lets a UI stream chatty deltas and display final deliverables.
+
+### 3.3 The "Part" Union
+
+Every payload is a `Part`:
+
+```
+
+type Part = TextPart | FilePart | DataPart;
+
+```
+
+This union means your model output ("here's a PNG and the JSON legend") is first‑class without MIME sniffing.
+
+## 4 Auth: Layered, Not Reinvented
+
+- **Transport layer**: TLS + whatever HTTP headers your org already uses (`Authorization: Bearer …`).
+
+- **Discovery layer**: Agent Card's `authentication` field declares required schemes (e.g., "Bearer", "ApiKey").
+
+- **Credential acquisition**: Clients obtain credentials out-of-band (OAuth flow, SSO, etc.) based on declared schemes.
+
+- **In‑task secondary auth**: When the agent needs _new_ creds mid‑flow (e.g., to access a 3rd-party API), it flips the task to `input‑required` and emits a `DataPart` describing what it needs.
+
+This clean separation keeps compliance teams happy with no secrets logged inside JSON bodies.
+
+## 5 RPC Surface
+
+| Method                       | Purpose                           |
+| ---------------------------- | --------------------------------- |
+| `tasks/send`                 | Fire‑and‑poll                     |
+| `tasks/sendSubscribe`        | Fire‑and‑stream                   |
+| `tasks/get`                  | Lazy hydrate                      |
+| `tasks/cancel`               | Idempotent cancel                 |
+| `tasks/pushNotification/set` | Webhook handshake                 |
+| `tasks/resubscribe`          | Re‑attach to SSE after disconnect |
+
+> **Subtlety:** `tasks/resubscribe` replays only **missed** events, not history. Your client must persist the last `event-id`.
+
+## 6 Implementation Sketch (Python 3.12 + httpx)
+
+```python
+
+import httpx, uuid, sseclient, json
+from typing import Dict, Any, Optional
+
+# Discover the agent and its capabilities
+def get_agent_card(url: str) -> Dict[str, Any]:
+    """Fetch and parse the Agent Card from the recommended location."""
+    response = httpx.get(f"{url}/.well-known/agent.json")
+    response.raise_for_status()  # Raises exception for 4XX/5XX responses
+    return response.json()
+
+# Use the discovered endpoint from the card
+AGENT_CARD = get_agent_card("https://agent.example.com")
+ENDPOINT = AGENT_CARD["url"]
+TOKEN = "your-auth-token"  # Obtained out-of-band based on AGENT_CARD["authentication"]
+
+def send_task(params: Dict[str, Any], stream: bool = False):
+    """Send a task to the A2A server, with optional streaming."""
+    method = "tasks/sendSubscribe" if stream else "tasks/send"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": uuid.uuid4().hex,
+    }
+    
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    
+    try:
+        r = httpx.post(
+            ENDPOINT, 
+            json=payload, 
+            headers=headers,
+            timeout=None if stream else 30
+        )
+        r.raise_for_status()
+        
+        if not stream:
+            response = r.json()
+            # Check for JSON-RPC error
+            if "error" in response:
+                error = response["error"]
+                raise Exception(f"A2A Error {error['code']}: {error['message']}")
+            return response["result"]
+        
+        return sseclient.SSEClient(r)  # iterate over .events()
+    
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            raise Exception("Authentication failed. Check your token.")
+        elif e.response.status_code == 404:
+            raise Exception(f"Endpoint not found: {ENDPOINT}")
+        else:
+            raise Exception(f"HTTP error {e.response.status_code}: {e.response.text}")
+    except Exception as e:
+        raise Exception(f"Failed to send task: {str(e)}")
+
+# Example usage: submitting a task
+task = send_task({
+    "id": "task-123",
+    "message": {
+        "role": "user",
+        "parts": [{"type": "text", "text": "What is the capital of France?"}]
+    }
+})
+print(f"Task status: {task['status']['state']}")
+
+# Example usage: streaming a task
+stream = send_task({
+    "id": "task-456",
+    "message": {
+        "role": "user",
+        "parts": [{"type": "text", "text": "Write a short story about Paris."}]
+    }
+}, stream=True)
+
+for event in stream.events():
+    data = json.loads(event.data)
+    result = data.get("result", {})
+    
+    # Handle status updates
+    if "status" in result:
+        print(f"Status update: {result['status']['state']}")
+        if result.get("final", False):
+            print("Final status reached")
+    
+    # Handle artifact updates
+    if "artifact" in result:
+        artifact = result["artifact"]
+        name = artifact.get("name", "unnamed")
+        print(f"Artifact update: {name}, last chunk: {artifact.get('lastChunk', False)}")
+        for part in artifact.get("parts", []):
+            if part["type"] == "text":
+                print(f"Text content: {part['text'][:50]}...")
+
+```
+
+## 7 Push Notifications: Handling Long-Running Tasks
+
+For tasks that might take minutes or hours, A2A offers push notifications alongside streaming:
+
+```python
+
+# Configure push notifications for a task
+def setup_push_notifications(task_id: str, webhook_url: str, webhook_token: str) -> Dict[str, Any]:
+    """Configure the A2A server to send push notifications to your webhook."""
+    return send_task({
+        "id": task_id,
+        "pushNotificationConfig": {
+            "url": webhook_url,
+            "token": webhook_token,
+            "authentication": {
+                "schemes": ["Bearer"],  # How the A2A server authenticates to your webhook
+                # "credentials": "..." # Optional config if server needs specific auth details
+            }
+        }
+    })
+
+# On your webhook server, handle incoming notifications:
+def handle_webhook(request):
+    # Validate the notification token
+    if request.headers.get("X-A2A-Notification-Token") != EXPECTED_TOKEN:
+        return {"error": "Invalid token"}, 403
+    
+    notification = request.json()
+    task_id = notification.get("taskId")
+    status = notification.get("status", {}).get("state")
+    
+    # Process the notification (e.g., notify user, update DB)
+    process_task_update(task_id, status)
+    
+    # If task is complete, you may want to fetch the full result
+    if status == "completed":
+        full_task = send_task({"id": task_id})
+        process_completed_task(full_task)
+    
+    return {"success": True}, 200
+
+```
+
+When using push notifications, the A2A server POSTs updates to your webhook URL whenever task status changes, allowing your application to react asynchronously without maintaining constant connections.
+
+## 8 Design Trade‑Offs & Open Questions
+
+| Choice             | Upside                                       | Cost                                           |
+| ------------------ | -------------------------------------------- | ---------------------------------------------- |
+| JSON over Protobuf | Readable, debuggable                         | Heavier on wire, no schema validation          |
+| SSE not WebSockets | No need for extra infra; fits HTTP semantics | SSE is server→client only                      |
+| Agent Card file    | Simple                                       | No discovery protocol, depends on distribution |
+| Task state machine | Predictable UI hooks                         | Requires client persistence                    |
+
+_Missing piece:_ Namespacing of `method` strings could lead to collisions as the ecosystem expands. A potential approach might be vendor prefixes (e.g., `google/tasks/send`) or adopting a URI-like scheme (e.g., `a2a://vendor.com/tasks/send`). The community should establish conventions here.
+
+## 9 Relationship with MCP (Model Context Protocol)
+
+A2A and [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) are complementary:
+
+- **MCP** standardizes how agents connect to and interact with tools, APIs, and data sources.
+- **A2A** standardizes how independent agents communicate with each other as peers.
+
+An A2A Client might request an A2A Server to perform a complex task, and that Server might internally use MCP to interact with several underlying tools to fulfill the A2A task.
+
+## 10 Why A2A Matters
+
+A2A does for agents what SMTP did for email: defines _enough_ structure to let independent systems swap value without sharing internals. By relying on boring tech like HTTP, JSON, and files, it invites experimentation today, not after a tooling overhaul.
+
+If you're building multi‑agent workflows, implement an A2A façade around each service now. Future you will thank present you.
+
+## 11 Common Implementation Patterns
+
+Here's a complete example of a multi-turn interaction where a client makes a request and the agent requires additional input:
+
+```javascript
+
+// CLIENT: Initial request
+const response = await fetch("https://agent.example.com/a2a/api", {
+  method: "POST",
+  headers: { 
+    "Content-Type": "application/json",
+    "Authorization": "Bearer your-token-here"
+  },
+  body: JSON.stringify({
+    "jsonrpc": "2.0",
+    "id": "req-123",
+    "method": "tasks/send",
+    "params": {
+      "id": "task-flight-789",
+      "message": {
+        "role": "user",
+        "parts": [{ "type": "text", "text": "I'd like to book a flight." }]
+      }
+    }
+  })
+});
+
+// SERVER: Responds with input-required
+{
+  "jsonrpc": "2.0",
+  "id": "req-123",
+  "result": {
+    "id": "task-flight-789",
+    "status": {
+      "state": "input-required",
+      "message": {
+        "role": "agent",
+        "parts": [{
+          "type": "text",
+          "text": "I can help with that. Where would you like to fly from and to? And when do you plan to travel?"
+        }]
+      },
+      "timestamp": "2024-04-15T10:00:00Z"
+    }
+  }
+}
+
+// CLIENT: Provides the requested input (using same task ID)
+const response2 = await fetch("https://agent.example.com/a2a/api", {
+  method: "POST",
+  headers: { 
+    "Content-Type": "application/json",
+    "Authorization": "Bearer your-token-here"
+  },
+  body: JSON.stringify({
+    "jsonrpc": "2.0",
+    "id": "req-124",
+    "method": "tasks/send",
+    "params": {
+      "id": "task-flight-789", // Same task ID to continue the conversation
+      "message": {
+        "role": "user",
+        "parts": [{ 
+          "type": "text", 
+          "text": "I want to fly from New York to London on May 15, returning May 22." 
+        }]
+      }
+    }
+  })
+});
+
+
+// SERVER: Processes and completes the task
+{
+  "jsonrpc": "2.0",
+  "id": "req-124",
+  "result": {
+    "id": "task-flight-789",
+    "status": {
+      "state": "completed",
+      "message": {
+        "role": "agent",
+        "parts": [{
+          "type": "text",
+          "text": "I've found some flight options for your trip from New York to London."
+        }]
+      },
+      "timestamp": "2024-04-15T10:05:00Z"
+    },
+    "artifacts": [{
+      "name": "Flight Options",
+      "index": 0,
+      "parts": [{
+        "type": "data",
+        "data": {
+          "outbound": [
+            {
+              "airline": "British Airways",
+              "flightNumber": "BA178",
+              "departure": "2024-05-15T18:30:00-04:00",
+              "arrival": "2024-05-16T06:45:00+01:00",
+              "price": 850
+            },
+            // More flight options...
+          ],
+          "return": [
+            // Return flight options...
+          ]
+        },
+        "metadata": {
+          "schemaUrl": "https://example.com/schemas/flight-options.json"
+        }
+      }]
+    }]
+  }
+}
+
+```
