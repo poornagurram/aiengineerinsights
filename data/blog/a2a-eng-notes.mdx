@@ -3,7 +3,13 @@
 **Why A2A?** 2024 produced a proliferation of agent frameworks, each exposing its own flavour of REST or webhook. A2A offers a concise JSON‑RPC contract so agents built in different stacks can exchange tasks, artifacts, and status updates without revealing internal details.
 
 This post is a code‑oriented walkthrough of the A2A v0.1.0 specification, surfacing the engineering trade‑offs behind key design choices and showing how they matter in real deployments.
-![[a2a_demo_arch.png]]
+<Image
+  src="/static/images/a2a_demo_arch.png"
+  alt="A2A Demo Architecture"
+  width={1200}
+  height={600}
+  className="w-full"
+/>
 
 Image Credits: https://github.com/google/A2A
 ## 1 Transport Decisions: Why HTTP(s) + JSON‑RPC + SSE (Server‑Sent Events)?
